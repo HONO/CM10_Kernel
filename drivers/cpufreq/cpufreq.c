@@ -273,8 +273,10 @@ void cpufreq_notify_transition(struct cpufreq_freqs *freqs, unsigned int state)
 		trace_cpu_frequency(freqs->new, freqs->cpu);
 		srcu_notifier_call_chain(&cpufreq_transition_notifier_list,
 				CPUFREQ_POSTCHANGE, freqs);
-		if (likely(policy) && likely(policy->cpu == freqs->cpu))
+		if (likely(policy) && likely(policy->cpu == freqs->cpu)) {
 			policy->cur = freqs->new;
+			sysfs_notify(&policy->kobj, NULL, "scaling_cur_freq");
+		}
 		break;
 	}
 }
@@ -363,7 +365,7 @@ static ssize_t show_##file_name				\
 }
 
 show_one(cpuinfo_min_freq, cpuinfo.min_freq);
-show_one(cpuinfo_max_freq, cpuinfo.max_freq);
+show_one(cpuinfo_max_freq, max);
 show_one(cpuinfo_transition_latency, cpuinfo.transition_latency);
 show_one(scaling_min_freq, min);
 show_one(scaling_max_freq, max);
@@ -574,6 +576,68 @@ static ssize_t show_bios_limit(struct cpufreq_policy *policy, char *buf)
 	return sprintf(buf, "%u\n", policy->cpuinfo.max_freq);
 }
 
+#ifdef CONFIG_VDD_USERSPACE
+
+extern ssize_t acpuclk_get_vdd_levels_str(char *buf);
+extern void acpuclk_set_vdd(unsigned acpu_khz, int vdd);
+
+static ssize_t show_vdd_levels(struct kobject *a, struct attribute *b, char *buf) {
+	return acpuclk_get_vdd_levels_str(buf);
+}
+
+static ssize_t store_vdd_levels(struct kobject *a, struct attribute *b, const char *buf, size_t count) {
+
+	int i = 0, j;
+	int pair[2] = { 0, 0 };
+	int sign = 0;
+
+	if (count < 1)
+		return 0;
+
+	if (buf[0] == '-') {
+		sign = -1;
+		i++;
+	}
+	else if (buf[0] == '+') {
+		sign = 1;
+		i++;
+	}
+
+	for (j = 0; i < count; i++) {
+	
+		char c = buf[i];
+		
+		if ((c >= '0') && (c <= '9')) {
+			pair[j] *= 10;
+			pair[j] += (c - '0');
+		}
+		else if ((c == ' ') || (c == '\t')) {
+			if (pair[j] != 0) {
+				j++;
+
+				if ((sign != 0) || (j > 1))
+					break;
+			}
+		}
+		else
+			break;
+	}
+
+	if (sign != 0) {
+		if (pair[0] > 0)
+			acpuclk_set_vdd(0, sign * pair[0]);
+	}
+	else {
+		if ((pair[0] > 0) && (pair[1] > 0))
+			acpuclk_set_vdd((unsigned)pair[0], pair[1]);
+		else
+			return -EINVAL;
+	}
+	return count;
+}
+
+#endif
+
 cpufreq_freq_attr_ro_perm(cpuinfo_cur_freq, 0400);
 cpufreq_freq_attr_ro(cpuinfo_min_freq);
 cpufreq_freq_attr_ro(cpuinfo_max_freq);
@@ -589,6 +653,10 @@ cpufreq_freq_attr_rw(scaling_max_freq);
 cpufreq_freq_attr_rw(scaling_governor);
 cpufreq_freq_attr_rw(scaling_setspeed);
 
+#ifdef CONFIG_VDD_USERSPACE
+define_one_global_rw(vdd_levels);
+#endif
+
 static struct attribute *default_attrs[] = {
 	&cpuinfo_min_freq.attr,
 	&cpuinfo_max_freq.attr,
@@ -603,6 +671,18 @@ static struct attribute *default_attrs[] = {
 	&scaling_setspeed.attr,
 	NULL
 };
+
+#ifdef CONFIG_VDD_USERSPACE
+static struct attribute *vddtbl_attrs[] = {
+	&vdd_levels.attr,
+	NULL
+};
+
+static struct attribute_group vddtbl_attr_group = {
+	.attrs = vddtbl_attrs,
+	.name = "vdd_table",
+};
+#endif
 
 struct kobject *cpufreq_global_kobject;
 EXPORT_SYMBOL(cpufreq_global_kobject);
@@ -890,6 +970,7 @@ static int cpufreq_add_dev(struct sys_device *sys_dev)
 	unsigned long flags;
 	unsigned int j;
 #ifdef CONFIG_HOTPLUG_CPU
+	struct cpufreq_policy *cp;
 	int sibling;
 #endif
 
@@ -938,10 +1019,14 @@ static int cpufreq_add_dev(struct sys_device *sys_dev)
 	/* Set governor before ->init, so that driver could check it */
 #ifdef CONFIG_HOTPLUG_CPU
 	for_each_online_cpu(sibling) {
-		struct cpufreq_policy *cp = per_cpu(cpufreq_cpu_data, sibling);
+		cp = per_cpu(cpufreq_cpu_data, sibling);
 		if (cp && cp->governor &&
 		    (cpumask_test_cpu(cpu, cp->related_cpus))) {
 			policy->governor = cp->governor;
+			policy->min = cp->min;
+			policy->max = cp->max;
+			policy->user_policy.min = cp->user_policy.min;
+			policy->user_policy.max = cp->user_policy.max;
 			found = 1;
 			break;
 		}
@@ -959,6 +1044,14 @@ static int cpufreq_add_dev(struct sys_device *sys_dev)
 	}
 	policy->user_policy.min = policy->min;
 	policy->user_policy.max = policy->max;
+
+	if (found) {
+		/* Calling the driver can overwrite policy frequencies again */
+		policy->min = cp->min;
+		policy->max = cp->max;
+		policy->user_policy.min = cp->user_policy.min;
+		policy->user_policy.max = cp->user_policy.max;
+	}
 
 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 				     CPUFREQ_START, policy);
@@ -1713,6 +1806,146 @@ error_out:
 	return ret;
 }
 
+#ifdef CONFIG_SEC_LIMIT_MAX_FREQ // limit max freq
+enum {
+	SET_MIN = 0,
+	SET_MAX
+};
+
+int cpufreq_set_limits_off(int cpu, unsigned int limit, unsigned int value)
+{
+	int ret = -EINVAL;	
+	unsigned long flags;
+
+	if (!(limit == SET_MIN || limit == SET_MAX))
+		goto out;
+	if (!cpu_is_offline(cpu))
+		goto out;
+
+	spin_lock_irqsave(&cpufreq_driver_lock, flags);
+
+	if (!cpufreq_driver)
+		goto out_unlock;
+
+	if (!try_module_get(cpufreq_driver->owner))
+		goto out_unlock;
+
+	if (limit == SET_MAX) {
+		if (per_cpu(cpufreq_policy_save, cpu).max)
+			per_cpu(cpufreq_policy_save, cpu).max = value;
+		else
+			goto out_put_module;
+	}
+	else {
+		if (per_cpu(cpufreq_policy_save, cpu).min)
+			per_cpu(cpufreq_policy_save, cpu).min = value;
+		else
+			goto out_put_module;		
+	}
+	ret = 0;
+	pr_info("%s: Setting [min/max:0/1] = %d frequency of cpu[%d]  to %d\n",  __func__, limit, cpu, value);
+
+out_put_module:
+	module_put(cpufreq_driver->owner);
+out_unlock:
+	spin_unlock_irqrestore(&cpufreq_driver_lock, flags);
+out:
+	return ret;
+}
+
+int cpufreq_set_limits(int cpu, unsigned int limit, unsigned int value)
+{
+	struct cpufreq_policy new_policy;
+	struct cpufreq_policy *cur_policy;
+	int ret = -EINVAL;
+
+	if (!(limit == SET_MIN || limit == SET_MAX))
+		goto out;
+	if (cpu_is_offline(cpu))
+		goto out;
+
+	cur_policy = cpufreq_cpu_get(cpu);
+	if (!cur_policy)
+		goto out;	
+	if (lock_policy_rwsem_write(cpu) < 0)		
+		goto out_put_freq;
+
+	memcpy(&new_policy, cur_policy, sizeof(struct cpufreq_policy));
+
+	if (limit == SET_MAX)
+	{
+		// for app boost = DVFS lock
+		if (cur_policy->min > value)
+		{
+			new_policy.min = value;
+			ret = __cpufreq_set_policy(cur_policy, &new_policy);
+			if(ret < 0) 	
+				goto out_unlock;
+
+			cur_policy->user_policy.min = cur_policy->min;
+		}
+
+		new_policy.max = value;	
+	}
+	else
+	{
+		// no other cases to change min value, now
+		if (cur_policy->max < value)
+			value = cur_policy->max;
+
+		new_policy.min = value;
+	}
+
+	ret = __cpufreq_set_policy(cur_policy, &new_policy);
+	if(ret < 0)		
+		goto out_unlock;
+
+	if (limit == SET_MAX)
+		cur_policy->user_policy.max = cur_policy->max;
+	else
+		cur_policy->user_policy.min = cur_policy->min;
+
+	ret = 0;
+	pr_info("%s: Setting [min/max:0/1] = %d frequency of cpu[%d]  to %d\n",  __func__, limit, cpu, value);
+out_unlock:
+	unlock_policy_rwsem_write(cpu);
+out_put_freq:
+	cpufreq_cpu_put(cur_policy);
+out:
+	return ret;
+}
+
+int cpufreq_get_limits(int cpu, unsigned int limit)
+{
+	struct cpufreq_policy *cur_policy;
+	int ret = -EINVAL;	
+	unsigned int value = 0;
+	if (!(limit == SET_MIN || limit == SET_MAX))
+		goto out;
+	if (cpu_is_offline(cpu))
+		goto out;
+	cur_policy = cpufreq_cpu_get(cpu);
+	if (!cur_policy)
+		goto out;	
+	if (lock_policy_rwsem_write(cpu) < 0)		
+		goto out_put_freq;
+
+	if (limit == SET_MAX)
+		value = cur_policy->max;	
+	else
+		value = cur_policy->min;
+
+	ret = value;
+	unlock_policy_rwsem_write(cpu);
+	pr_info("%s: [min/max:0/1] = %d frequency of cpu[%d]: %d\n", __func__, limit, cpu, value);
+
+out_put_freq:
+	cpufreq_cpu_put(cur_policy);
+out:
+	return ret;		
+}
+#endif
+
 /**
  *	cpufreq_update_policy - re-evaluate an existing cpufreq policy
  *	@cpu: CPU which shall be re-evaluated
@@ -1908,6 +2141,9 @@ EXPORT_SYMBOL_GPL(cpufreq_unregister_driver);
 static int __init cpufreq_core_init(void)
 {
 	int cpu;
+#ifdef CONFIG_VDD_USERSPACE
+	int rc;
+#endif
 
 	for_each_possible_cpu(cpu) {
 		per_cpu(cpufreq_policy_cpu, cpu) = -1;
@@ -1918,6 +2154,10 @@ static int __init cpufreq_core_init(void)
 						&cpu_sysdev_class.kset.kobj);
 	BUG_ON(!cpufreq_global_kobject);
 	register_syscore_ops(&cpufreq_syscore_ops);
+
+#ifdef CONFIG_VDD_USERSPACE
+	rc = sysfs_create_group(cpufreq_global_kobject, &vddtbl_attr_group);
+#endif
 
 	return 0;
 }

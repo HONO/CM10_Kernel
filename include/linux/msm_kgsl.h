@@ -49,7 +49,7 @@ enum kgsl_ctx_reset_stat {
 	KGSL_CTX_STAT_UNKNOWN_CONTEXT_RESET_EXT		= 0x00000003
 };
 
-#define KGSL_MAX_PWRLEVELS 5
+#define KGSL_MAX_PWRLEVELS 7
 
 #define KGSL_CONVERT_TO_MBPS(val) \
 	(val*1000*1000U)
@@ -177,6 +177,7 @@ struct kgsl_device_iommu_data {
 struct kgsl_device_platform_data {
 	struct kgsl_pwrlevel pwrlevel[KGSL_MAX_PWRLEVELS];
 	int init_level;
+	int max_level;
 	int num_levels;
 	int (*set_grp_async)(void);
 	unsigned int idle_timeout;

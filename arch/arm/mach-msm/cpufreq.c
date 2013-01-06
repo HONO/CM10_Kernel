@@ -67,7 +67,7 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq)
 		freqs.new = new_freq;
 	freqs.cpu = policy->cpu;
 	cpufreq_notify_transition(&freqs, CPUFREQ_PRECHANGE);
-	ret = acpuclk_set_rate(policy->cpu, new_freq, SETRATE_CPUFREQ);
+	ret = acpuclk_set_rate(policy->cpu, freqs.new, SETRATE_CPUFREQ);
 	if (!ret)
 		cpufreq_notify_transition(&freqs, CPUFREQ_POSTCHANGE);
 
@@ -84,6 +84,53 @@ static void set_cpu_work(struct work_struct *work)
 	complete(&cpu_work->complete);
 }
 #endif
+
+#ifdef CONFIG_SEC_LIMIT_MAX_FREQ
+extern bool lmf_screen_state;
+#endif
+
+static void msm_cpu_early_suspend(struct early_suspend *h)
+{
+	int cpu = 0;
+
+	for_each_possible_cpu(cpu) {
+		mutex_lock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+
+		/* disable 2nd core as well since screen is off */
+		if (cpu == 0 && num_online_cpus() > 1) {
+#ifdef CONFIG_SEC_LIMIT_MAX_FREQ
+			lmf_screen_state = false;
+#endif
+			cpu_down(1);
+		}
+		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+	}
+}
+
+static void msm_cpu_late_resume(struct early_suspend *h)
+{
+	int cpu = 0;
+
+	for_each_possible_cpu(cpu) {
+
+		mutex_lock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+
+		/* re-enable 2nd core */
+		if (num_online_cpus() < 2 && cpu == 0) {
+#ifdef CONFIG_SEC_LIMIT_MAX_FREQ
+			lmf_screen_state = true;
+#endif
+			cpu_up(1);
+			}
+		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+	}
+}
+
+static struct early_suspend msm_cpu_early_suspend_handler = {
+	.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN,
+	.suspend = msm_cpu_early_suspend,
+	.resume = msm_cpu_late_resume,
+};
 
 static int msm_cpufreq_target(struct cpufreq_policy *policy,
 				unsigned int target_freq,
@@ -179,16 +226,17 @@ static int __cpuinit msm_cpufreq_init(struct cpufreq_policy *policy)
 		return -ENODEV;
 
 	table = cpufreq_frequency_get_table(policy->cpu);
+	if (table == NULL)
+		return -ENODEV;
 	if (cpufreq_frequency_table_cpuinfo(policy, table)) {
 #ifdef CONFIG_MSM_CPU_FREQ_SET_MIN_MAX
 		policy->cpuinfo.min_freq = CONFIG_MSM_CPU_FREQ_MIN;
 		policy->cpuinfo.max_freq = CONFIG_MSM_CPU_FREQ_MAX;
+#else
+		policy->cpuinfo.min_freq = 192000;
+		policy->cpuinfo.max_freq = 1512000;
 #endif
 	}
-#ifdef CONFIG_MSM_CPU_FREQ_SET_MIN_MAX
-	policy->min = CONFIG_MSM_CPU_FREQ_MIN;
-	policy->max = CONFIG_MSM_CPU_FREQ_MAX;
-#endif
 
 	cur_freq = acpuclk_get_rate(policy->cpu);
 	if (cpufreq_frequency_table_target(policy, table, cur_freq,
@@ -221,6 +269,13 @@ static int __cpuinit msm_cpufreq_init(struct cpufreq_policy *policy)
 	init_completion(&cpu_work->complete);
 #endif
 
+#ifdef CONFIG_MSM_CPU_FREQ_SET_MIN_MAX
+	policy->min = CONFIG_MSM_CPU_FREQ_MIN;
+	policy->max = CONFIG_MSM_CPU_FREQ_MAX;
+#else
+	policy->min = 192000;
+	policy->max = 1512000;
+#endif
 	return 0;
 }
 
@@ -233,6 +288,8 @@ static int msm_cpufreq_suspend(void)
 		per_cpu(cpufreq_suspend, cpu).device_suspended = 1;
 		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
 	}
+	if (num_online_cpus() > 1)
+		cpu_down(1);
 
 	return NOTIFY_DONE;
 }
@@ -320,6 +377,9 @@ static int __init msm_cpufreq_register(void)
 #endif
 
 	register_pm_notifier(&msm_cpufreq_pm_notifier);
+
+	register_early_suspend(&msm_cpu_early_suspend_handler);
+
 	return cpufreq_register_driver(&msm_cpufreq_driver);
 }
 
