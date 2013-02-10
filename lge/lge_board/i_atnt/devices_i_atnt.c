@@ -731,7 +731,7 @@ static struct msm_bus_paths grp2d0_bus_scale_usecases[] = {
 	},
 	{
 		ARRAY_SIZE(grp2d0_nominal_low_vectors),
-		grp2d0_nominal_vectors,
+		grp2d0_nominal_low_vectors,
 	},
 	{
 		ARRAY_SIZE(grp2d0_nominal_vectors),
@@ -791,7 +791,7 @@ static struct msm_bus_paths grp2d1_bus_scale_usecases[] = {
 	},
 	{
 		ARRAY_SIZE(grp2d1_nominal_low_vectors),
-		grp2d1_nominal_vectors,
+		grp2d1_nominal_low_vectors,
 	},
 	{
 		ARRAY_SIZE(grp2d1_nominal_vectors),
